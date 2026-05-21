@@ -1,0 +1,329 @@
+# edge_former — LLM Context File
+# Generated for use with Claude or any LLM to understand this repository quickly.
+# Drop this file (plus any source files you want reviewed) into your conversation.
+
+---
+
+## What This Project Is
+
+**edge_former** runs real-time SpO2 (blood oxygen) inference on a Seeed XIAO nRF52840
+microcontroller. A cross-attention transformer is trained in PyTorch, quantised to INT8,
+exported to plain C header files, and flashed to the device — no runtime ML framework,
+no cloud dependency.
+
+Target accuracy: FDA/ISO ±2% SpO2 tolerance after INT8 quantisation.
+Target device: nRF52840 (Cortex-M4 + FPU, 256 KB RAM, 1 MB flash).
+
+---
+
+## Repository Layout
+
+```
+edge_former/
+├── data/
+│   └── Subject*_DOVE_Hypoxia_Study_RValue_RawPPG.h5   # DOVE Hypoxia Study, 10 subjects
+│
+└── src/
+    ├── python/
+    │   ├── test12.py                  # FP32 training script (main model definition)
+    │   └── Qtest.py                   # Quantisation-aware training (QAT) fine-tuning
+    │
+    ├── export_weights.py              # PyTorch checkpoint → INT8 .bin blobs + meta.h
+    ├── generate_weight_headers.py     # .bin blobs → C static-array headers
+    ├── gen_test_data_header.py        # reference outputs → test_data.h for on-device self-test
+    ├── validate.py                    # NumPy re-implementation vs PyTorch (Level 1 check)
+    ├── test_desktop.cpp               # x86 C++ harness that runs spo2_model.h (Level 2 check)
+    │
+    ├── spo2_model.h                   # THE inference engine — single-file, no dependencies
+    ├── meta.h                         # C #defines: shapes, scales, y_mean/y_std (generated)
+    ├── weights_flash.h                # C static arrays of INT8 weights (generated)
+    ├── weights_init.h                 # spo2_weights_init() function (generated)
+    ├── test_data.h                    # Embedded PPG windows + reference outputs (generated)
+    │
+    └── spo2_inference/
+        └── spo2_inference.ino         # Arduino sketch: self-test + live inference loop
+```
+
+---
+
+## Model Architecture
+
+```
+  red[T]  ──► ConvEncoder ──► red_tok [T_out, 64]
+                                      │
+  skintone ─► SkinFiLM ──► γ, β ──► FiLM ──► red_tok_film [T_out, 64]
+                                                     │                │
+  ir[T]  ───► ConvEncoder ──► ir_tok [T_out, 64]    │                │
+                                      │              ▼                ▼
+                               ┌──────┴──────────────────────────────┐
+                               │  Cross-Attention (bidirectional)     │
+                               │  r2i: q=red_film, kv=ir  ──► red'   │
+                               │  i2r: q=ir, kv=red_film  ──► ir'    │
+                               └──────┬───────────────────────┬──────┘
+                                      │                       │
+                                      └──────── cat ──────────┘
+                                               │
+                                        fused [T_out, 128]
+                                               │
+                                   TemporalSelfAttention (MHA, 4 heads)
+                                               │
+                                      fused [T_out, 128]
+                                               │
+                                    AttentionPooling (learned scalar scores)
+                                               │
+                                          vec [128]
+                                               │
+                                  Regressor MLP: 128→64→16→1
+                                               │
+                                     SpO2 (%) — de-normalised
+```
+
+### Key Components
+
+- **ConvTokenEncoder**: 3× (Conv1d → BatchNorm → ReLU). First block k=5 pad=1
+  reduces T by 2; subsequent blocks k=3 pad=1 preserve length. BN is fused into
+  Conv weights offline before export so the C inference engine only does Conv+bias.
+
+- **SkinFiLM**: Two-layer MLP (1 → 32 → 4×64). Maps scalar skin tone to four
+  vectors (γ_r, β_r, γ_i, β_i). Applied as:
+    red_tok = red_tok * (1 + γ_r) + β_r
+
+- **CrossAttentionBlock**: Standard MHA (4 heads, dim=64). IMPORTANT: both r2i
+  and i2r use a *saved copy* of the pre-cross-attended tokens as kv to avoid a
+  data dependency bug where the first direction's output would corrupt the second.
+
+- **TemporalSelfAttentionBlock**: MHA (4 heads, dim=128) over the concatenated
+  [T_out, 128] stream. Includes FFN (128→256→128) and two LayerNorms.
+
+- **AttentionPooling**: Learned two-layer score network (128→256→1, Tanh middle).
+  Softmax over T tokens → weighted sum → [128] vector.
+
+- **Regressor**: Linear(128→64) → ReLU → Linear(64→16) → ReLU → Linear(16→1).
+  Output = (raw_out × y_std) + y_mean.
+
+### Quantisation
+
+All weight matrices (Conv, Linear, MHA projections) are symmetrically quantised to
+INT8 at export time using per-tensor abs-max scaling:
+  scale = max(|W|) / 127.0
+  W_i8  = round(W / scale).clip(-127, 127)
+
+Biases and LayerNorm parameters stay in FP32. The C forward pass computes:
+  output = W_i8 @ x * scale + bias
+which is int8·float32 → float32 (no full INT8 accumulation on nRF52840).
+
+---
+
+## Data Format
+
+Source: DOVE Hypoxia Study .h5 files (10 subjects).
+Each row in the HDF5 table has:
+  - red_win_filtered  : numpy array of length window_size (float)
+  - ir_win_filtered   : numpy array of length window_size (float)
+  - SpO2_Rad          : ground-truth SpO2 % (float)
+  - skintone          : ITA/Fitzpatrick-like scalar (float)
+  - timestamp         : datetime (unused at inference)
+
+Training normalises SpO2 labels:  y_norm = (y - y_mean) / y_std
+Input signals are optionally z-score normalised per window if normalize_seq=True
+(must match NORMALIZE_INPUT in spo2_inference.ino at inference time).
+
+---
+
+## End-to-End Workflow
+
+### Step 1 — Train FP32 model
+```bash
+python test12.py
+```
+Outputs: best_raw_cross_attention_spo2_skinfilm.pt
+
+Key hyperparameters (top of test12.py):
+  window_size  = 400   # ⚠ reduce to 50 to fit nRF52840 RAM (see Memory Budget)
+  stride       = 400   # non-overlapping windows
+  hidden_dim   = 64
+  num_epochs   = 100
+  lr           = 1e-3  # AdamW
+
+### Step 2 — (Optional) QAT fine-tuning
+```bash
+python Qtest.py
+```
+Runs 10 epochs. Outputs:
+  best_raw_cross_attention_spo2_skinfilm_qat_fakequant.pt
+  best_raw_cross_attention_spo2_skinfilm_qat_converted.pt
+
+### Step 3 — Export weights
+```bash
+python export_weights.py --ckpt best_raw_cross_attention_spo2_skinfilm.pt --out weights
+```
+Fuses BN into Conv, quantises to INT8, writes:
+  weights/*.bin    — raw binary blobs
+  weights/meta.h   — C #defines for shapes, scales, Y_MEAN, Y_STD
+
+Inspect exported shapes without rerunning:
+```bash
+python export_weights.py --diag --out weights
+```
+
+### Step 4 — Generate C array headers
+```bash
+python generate_weight_headers.py --weights_dir weights
+```
+Outputs:
+  weights/weights_flash.h   — static const int8_t / float arrays
+  weights/weights_init.h    — spo2_weights_init() function
+
+### Step 5 — Validate on desktop
+
+Level 1 (NumPy vs PyTorch — checks export logic):
+```bash
+python validate.py \
+    --ckpt python/best_raw_cross_attention_spo2_skinfilm.pt \
+    --weights_dir weights \
+    --h5_dir ../data \
+    --n_windows 20 \
+    --dump_ref reference.bin
+```
+Expected: max error < 2.0 SpO2 %
+Use --fp32_test to check NumPy logic before quantisation (expected < 0.01%).
+
+Level 2 (C++ x86 vs PyTorch — checks spo2_model.h):
+```bash
+g++ -O2 -std=c++11 -lm -o test_desktop test_desktop.cpp
+./test_desktop reference.bin weights
+```
+Expected: max error < 0.15 SpO2 %
+
+### Step 6 — Generate embedded test data
+```bash
+python gen_test_data_header.py \
+    --ref reference.bin \
+    --out spo2_inference/test_data.h \
+    --seq_len 400 \
+    --max_windows 5 \
+    --tolerance 2.0
+```
+Flash cost: ~3.2 KB/window at T=400; ~0.4 KB/window at T=50.
+
+### Step 7 — Flash to device
+1. Copy generated headers into sketch folder:
+     spo2_inference/weights/meta.h
+     spo2_inference/weights/weights_flash.h
+     spo2_inference/weights/weights_init.h
+     spo2_inference/test_data.h
+2. Open spo2_inference/spo2_inference.ino in Arduino IDE.
+3. Board: Seeed XIAO nRF52840 Sense
+4. Upload → Serial Monitor at 115200 baud.
+   On boot: runs self-test (PASS/FAIL per window), then live inference loop.
+   Replace read_ppg_window() stub with real sensor driver (e.g. MAX30102 over I2C).
+
+---
+
+## Memory Budget
+
+At T=400, D=64 (WARNING: exceeds nRF52840's 256 KB RAM):
+  Red encoder tokens      : 398 × 64 × 4 B =  102 KB
+  IR encoder tokens       : 398 × 64 × 4 B =  102 KB
+  Fused tokens            : 398 × 128 × 4 B = 204 KB
+  MHA scratch (Q/K/V proj): 398 × 128 × 4 B × 3 = 611 KB
+  INT8 weights (flash)    : ~180 KB
+  FP32 biases/LN (flash)  : ~30 KB
+
+⚠ SOLUTION: retrain with window_size=50. T_out=48:
+  Encoder buffers drop to 2 × (48×64×4) ≈ 24 KB total. Fits comfortably.
+  Update MODEL_SEQ_LEN in spo2_inference.ino and test_desktop.cpp to match.
+
+---
+
+## Validation Chain
+
+```
+PyTorch training
+      │
+      ▼
+export_weights.py  (BN fusion + INT8 quant)
+      │
+      ▼
+validate.py ─── Level 1: NumPy vs PyTorch ─── max error < 2.0%
+      │
+      ▼
+test_desktop.cpp ── Level 2: C++ x86 vs PyTorch ── max error < 0.15%
+      │
+      ▼
+spo2_inference.ino ── Level 3: on-device self-test ── PASS / HALT
+```
+
+---
+
+## C Inference API (spo2_model.h)
+
+```c
+// Primary inference call
+float spo2_infer(
+    const float* red,       // [MODEL_SEQ_LEN] — normalised PPG red channel
+    const float* ir,        // [MODEL_SEQ_LEN] — normalised PPG IR channel
+    float skintone,         // scalar skin tone value
+    const SpO2ModelWeights* w
+);
+
+// Weight struct is populated by:
+void spo2_weights_init(SpO2ModelWeights* w);  // defined in weights_init.h
+```
+
+Key #defines (override before including spo2_model.h):
+  MODEL_SEQ_LEN       — window length T (default 40, match training window_size)
+  MODEL_HIDDEN_DIM    — transformer width (default 64)
+  MODEL_NUM_HEADS     — attention heads (default 4)
+  CHUNKED_ATTN_SIZE   — query rows per attention chunk (default 8, reduce to save RAM)
+  NORMALIZE_INPUT     — set true only if trained with normalize_seq=True
+
+---
+
+## Configuration Reference
+
+| Parameter           | File                | Default | Notes                              |
+|---------------------|---------------------|---------|------------------------------------|
+| MODEL_SEQ_LEN       | sketch / .cpp       | 400     | Must match training window_size    |
+| CHUNKED_ATTN_SIZE   | spo2_model.h        | 8       | Reduce to save RAM                 |
+| NORMALIZE_INPUT     | sketch              | false   | Match normalize_seq in test12.py   |
+| --window_size       | test12.py           | 400     | Sequence length for training       |
+| --hidden_dim        | test12.py           | 64      | Transformer hidden dim             |
+| --val_size          | test12.py           | 0.1     | Subject fraction for validation    |
+| --num_epochs        | test12.py           | 100     | Training epochs (QAT uses 10)      |
+
+---
+
+## Known Gotchas
+
+1. **T=400 won't fit in RAM.** Retrain with window_size=50 for the nRF52840. The
+   README memory table lists T=400 for reference only.
+
+2. **Cross-attention kv snapshot.** r2i and i2r both take their kv from the
+   *pre-cross-attended* copies of red/ir tokens. If you refactor, make sure to
+   snapshot before either cross-attention runs, not after.
+
+3. **BN fusion is offline only.** spo2_model.h has no BatchNorm code. BN is
+   folded into Conv weights by export_weights.py. Do not add BN to spo2_model.h.
+
+4. **INT8 is per-tensor symmetric (no zero-point).** Biases and LayerNorm weights
+   are FP32. The inner-loop computation is int8 × float32 scale → float32, not
+   true INT8 accumulation.
+
+5. **NORMALIZE_INPUT must match training.** If test12.py was run with
+   normalize_seq=True, set NORMALIZE_INPUT 1 in the sketch. They default to
+   False / false (do not normalise).
+
+6. **SpO2ModelWeights struct is auto-generated.** Do not hand-edit weights_init.h
+   or weights_flash.h — always regenerate from export_weights.py +
+   generate_weight_headers.py.
+
+---
+## Python Dependencies
+
+torch >= 2.0, numpy, pandas, tables (pd.read_hdf), scikit-learn
+
+## C++ / Arduino Dependencies
+
+None beyond standard libc (<math.h>, <string.h>).
+Arduino board: Seeed nRF52 Boards (install via Arduino Board Manager).
